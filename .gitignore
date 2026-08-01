@@ -1,0 +1,9 @@
+*.js
+!jest.config.js
+*.d.ts
+node_modules
+*.generated.ts
+cdk.out
+.cdk.staging
+.env
+.DS_Store
