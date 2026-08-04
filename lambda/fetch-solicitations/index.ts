@@ -65,6 +65,9 @@ async function fetchOpportunities(
   url.searchParams.set('postedFrom', postedFrom);
   url.searchParams.set('postedTo', postedTo);
   url.searchParams.set('limit', '1000');
+  // ptype = notice type code; 'o' = Solicitation. Narrows results to solicitations
+  // only, per the SAM.gov Opportunities API notice type codes.
+  url.searchParams.set('ptype', 'o');
 
   const response = await fetch(url.toString());
   if (!response.ok) {
