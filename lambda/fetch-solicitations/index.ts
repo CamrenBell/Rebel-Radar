@@ -3,7 +3,9 @@ import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dyn
 import { SNSClient, PublishCommand } from '@aws-sdk/client-sns';
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 
-const ddbClient = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+const ddbClient = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
+  marshallOptions: { removeUndefinedValues: true },
+});
 const snsClient = new SNSClient({});
 const secretsClient = new SecretsManagerClient({});
 
@@ -14,9 +16,26 @@ const SECRET_ARN = process.env.SECRET_ARN!;
 interface SamOpportunity {
   noticeId: string;
   title: string;
-  postedDate: string;
-  uiLink?: string;
   solicitationNumber?: string;
+  type?: string;
+  baseType?: string;
+  postedDate: string;
+  // NOTE: "reponseDeadLine" is misspelled in the SAM.gov API response itself.
+  // Keep the typo — renaming it here would just make the field come back undefined.
+  reponseDeadLine?: string;
+  naicsCode?: string;
+  setAside?: string;
+  setAsideCode?: string;
+  uiLink?: string;
+  fullParentPathName?: string;
+  classificationCode?: string;
+  placeOfPerformance?: {
+    city?: { name?: string };
+    state?: { name?: string };
+  };
+  active?: string;
+  // Raw link to the full description text, not the resolved text itself.
+  description?: string;
 }
 
 function formatDate(d: Date): string {
@@ -64,11 +83,52 @@ async function isNew(noticeId: string): Promise<boolean> {
   return !result.Item;
 }
 
-async function markSeen(noticeId: string): Promise<void> {
+async function markSeen(opp: SamOpportunity): Promise<void> {
   const ttl = Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 90; // keep 90 days
   await ddbClient.send(
-    new PutCommand({ TableName: TABLE_NAME, Item: { noticeId, ttl } })
+    new PutCommand({
+      TableName: TABLE_NAME,
+      Item: {
+        noticeId: opp.noticeId,
+        title: opp.title,
+        solicitationNumber: opp.solicitationNumber,
+        type: opp.type,
+        baseType: opp.baseType,
+        postedDate: opp.postedDate,
+        reponseDeadLine: opp.reponseDeadLine,
+        naicsCode: opp.naicsCode,
+        setAside: opp.setAside,
+        setAsideCode: opp.setAsideCode,
+        uiLink: opp.uiLink,
+        fullParentPathName: opp.fullParentPathName,
+        classificationCode: opp.classificationCode,
+        placeOfPerformance: opp.placeOfPerformance,
+        active: opp.active,
+        descriptionLink: opp.description,
+        ttl,
+      },
+    })
   );
+}
+
+function formatOpportunity(o: SamOpportunity): string {
+  const lines = [`• ${o.title}`];
+  if (o.solicitationNumber) lines.push(`  Solicitation #: ${o.solicitationNumber}`);
+  if (o.type) lines.push(`  Type: ${o.type}`);
+  if (o.reponseDeadLine) lines.push(`  Response deadline: ${o.reponseDeadLine}`);
+  if (o.naicsCode) lines.push(`  NAICS: ${o.naicsCode}`);
+  if (o.setAside) lines.push(`  Set-aside: ${o.setAside}`);
+  if (o.fullParentPathName) lines.push(`  Agency: ${o.fullParentPathName}`);
+
+  const city = o.placeOfPerformance?.city?.name;
+  const state = o.placeOfPerformance?.state?.name;
+  if (city || state) {
+    lines.push(`  Place of performance: ${[city, state].filter(Boolean).join(', ')}`);
+  }
+
+  if (o.uiLink) lines.push(`  ${o.uiLink}`);
+
+  return lines.join('\n');
 }
 
 export const handler = async (): Promise<{ newCount: number }> => {
@@ -88,12 +148,12 @@ export const handler = async (): Promise<{ newCount: number }> => {
   for (const opp of opportunities) {
     if (await isNew(opp.noticeId)) {
       newOnes.push(opp);
-      await markSeen(opp.noticeId);
+      await markSeen(opp);
     }
   }
 
   const messageBody = newOnes.length
-    ? newOnes.map((o) => `• ${o.title}${o.uiLink ? `\n  ${o.uiLink}` : ''}`).join('\n\n')
+    ? newOnes.map(formatOpportunity).join('\n\n')
     : 'No new solicitations posted in the last day.';
 
   await snsClient.send(
