@@ -8,11 +8,29 @@ import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as lambdaNode from 'aws-cdk-lib/aws-lambda-nodejs';
+import * as iam from 'aws-cdk-lib/aws-iam';
 import * as path from 'path';
+
+// Keep in sync with lambda/fetch-solicitations/index.ts's EMBEDDING_MODEL_ID
+// default — used here to scope the Bedrock IAM permission to this one model.
+const EMBEDDING_MODEL_ID = 'amazon.titan-embed-text-v2:0';
 
 export interface RebelRadarStackProps extends cdk.StackProps {
   /** Email address to receive the daily solicitation digest */
   alertEmail?: string;
+  /**
+   * Minimum cosine-similarity score (0–1) a solicitation must have against
+   * the company profile embedding to be included in the email digest at
+   * all. Deploy-time override: `cdk deploy -c relevanceThreshold=0.7`
+   */
+  relevanceThreshold?: string;
+  /**
+   * Cosine-similarity score (0–1) at/above which a solicitation is labeled
+   * "High" relevance instead of "Medium" in the digest. Must stay >=
+   * relevanceThreshold to be meaningful. Deploy-time override:
+   * `cdk deploy -c highRelevanceThreshold=0.9`
+   */
+  highRelevanceThreshold?: string;
 }
 
 export class RebelRadarStack extends cdk.Stack {
@@ -65,12 +83,28 @@ export class RebelRadarStack extends cdk.Stack {
         TABLE_NAME: seenTable.tableName,
         TOPIC_ARN: alertTopic.topicArn,
         SECRET_ARN: samApiSecret.secretArn,
+        EMBEDDING_MODEL_ID,
+        RELEVANCE_THRESHOLD: props?.relevanceThreshold ?? '0.75',
+        HIGH_RELEVANCE_THRESHOLD: props?.highRelevanceThreshold ?? '0.85',
       },
     });
 
     seenTable.grantReadWriteData(fetchFn);
     alertTopic.grantPublish(fetchFn);
     samApiSecret.grantRead(fetchFn);
+
+    // ---------------------------------------------------------------------
+    // Bedrock: relevance-scoring embeddings (Titan Text Embeddings V2)
+    // Scoped to the one model the Lambda actually calls, not all of Bedrock.
+    // ---------------------------------------------------------------------
+    fetchFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['bedrock:InvokeModel'],
+        resources: [
+          `arn:${cdk.Aws.PARTITION}:bedrock:${this.region}::foundation-model/${EMBEDDING_MODEL_ID}`,
+        ],
+      })
+    );
 
     // ---------------------------------------------------------------------
     // Schedule: 13:00 UTC daily (~6:00 AM Mountain Time)
