@@ -3,7 +3,7 @@ import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dyn
 import { SNSClient, PublishCommand } from '@aws-sdk/client-sns';
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 import { COMPANY_PROFILE_TEXT } from './company-profile';
-import { cosineSimilarity, embedBatch, getOrCreateProfileEmbedding, mapWithConcurrency } from './embeddings';
+import { cosineSimilarity, embedText, getOrCreateProfileEmbedding, mapWithConcurrency } from './embeddings';
 
 const ddbClient = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
@@ -61,6 +61,24 @@ interface ScoredOpportunity {
   score: number;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Tripped for the rest of a single Lambda invocation once SAM.gov responds
+ * with 429 to any call. SAM.gov's 429 has repeatedly turned out to mean
+ * "daily request quota exhausted," not a short per-second throttle, so
+ * backing off and retrying the same request is pointless and just spends
+ * more of a quota that's already gone. Once tripped, remaining
+ * description-text lookups short-circuit locally (degrading gracefully to
+ * an empty description, same as any other resolution failure) instead of
+ * making a network call we already know will fail.
+ */
+interface SamQuotaState {
+  exhausted: boolean;
+}
+
 function formatDate(d: Date): string {
   // SAM.gov API expects MM/dd/yyyy
   const mm = String(d.getMonth() + 1).padStart(2, '0');
@@ -78,6 +96,9 @@ async function getApiKey(): Promise<string> {
   return secretValue.apiKey;
 }
 
+const FETCH_MAX_RETRIES = 3;
+const FETCH_BASE_DELAY_MS = 500;
+
 async function fetchOpportunities(
   apiKey: string,
   postedFrom: string,
@@ -92,14 +113,24 @@ async function fetchOpportunities(
   // only, per the SAM.gov Opportunities API notice type codes.
   url.searchParams.set('ptype', 'o');
 
-  const response = await fetch(url.toString());
-  if (!response.ok) {
+  for (let attempt = 0; ; attempt++) {
+    const response = await fetch(url.toString());
+    if (response.ok) {
+      const data: any = await response.json();
+      return data.opportunitiesData ?? [];
+    }
+
     const body = await response.text();
+    // 429 from SAM.gov has consistently meant "daily request quota
+    // exhausted" rather than a short-lived throttle -- retrying just spends
+    // more of a quota that's already gone, so fail immediately instead of
+    // backing off. Only retry genuinely transient failures (5xx).
+    if (response.status !== 429 && response.status >= 500 && attempt < FETCH_MAX_RETRIES) {
+      await sleep(FETCH_BASE_DELAY_MS * 2 ** attempt + Math.random() * 200);
+      continue;
+    }
     throw new Error(`SAM.gov API error ${response.status}: ${body}`);
   }
-
-  const data: any = await response.json();
-  return data.opportunitiesData ?? [];
 }
 
 async function isNew(noticeId: string): Promise<boolean> {
@@ -164,8 +195,13 @@ const MAX_DESCRIPTION_CHARS = 6000;
  * embedding purposes — on any failure (timeout, non-2xx, bad JSON) fall
  * back to an empty string rather than failing the run.
  */
-async function resolveDescriptionText(link: string | undefined, apiKey: string): Promise<string> {
+async function resolveDescriptionText(
+  link: string | undefined,
+  apiKey: string,
+  samQuota: SamQuotaState
+): Promise<string> {
   if (!link) return '';
+  if (samQuota.exhausted) return '';
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 8000);
@@ -175,7 +211,10 @@ async function resolveDescriptionText(link: string | undefined, apiKey: string):
       url.searchParams.set('api_key', apiKey);
     }
     const response = await fetch(url.toString(), { signal: controller.signal });
-    if (!response.ok) return '';
+    if (!response.ok) {
+      if (response.status === 429) samQuota.exhausted = true;
+      return '';
+    }
 
     const raw = await response.text();
     let text = raw;
@@ -217,12 +256,22 @@ function relevanceLabel(score: number): string {
 
 /**
  * Scores newly-seen opportunities against the cached company profile
- * embedding. Returns every opportunity with its score, unfiltered and in
+ * embedding and checkpoints each one to DynamoDB (via markSeen) as soon as
+ * its own score is computed — not after the whole batch finishes. That way
+ * a timeout or crash partway through only loses the items still in flight;
+ * everything already scored stays marked "seen" and won't be re-fetched
+ * (re-spending SAM.gov request quota) on the next run.
+ *
+ * A single item's failure (Bedrock exhausts its own retries, etc.) is
+ * caught and logged rather than aborting the batch — that item is simply
+ * left unmarked and will be picked up again on a future run.
+ *
+ * Returns every opportunity that was successfully scored, unfiltered and in
  * input order — callers decide what to do with items below
  * RELEVANCE_THRESHOLD (currently: still recorded in DynamoDB as "Low", just
  * left out of the email).
  */
-async function scoreOpportunities(
+async function scoreAndPersistOpportunities(
   opportunities: SamOpportunity[],
   apiKey: string
 ): Promise<ScoredOpportunity[]> {
@@ -236,22 +285,31 @@ async function scoreOpportunities(
     PROFILE_EMBEDDING_KEY
   );
 
-  // Resolve description text first (small-concurrency HTTP fan-out), then
-  // embed the resulting blobs (small-concurrency Bedrock fan-out). Both
-  // stages only touch the already-deduped "new" set, not the full daily pull.
-  const descriptionTexts = await mapWithConcurrency(
+  const samQuota: SamQuotaState = { exhausted: false };
+  const results: (ScoredOpportunity | undefined)[] = new Array(opportunities.length);
+
+  await mapWithConcurrency(
     opportunities,
-    (o) => resolveDescriptionText(o.description, apiKey),
+    async (opportunity, i) => {
+      try {
+        const descriptionText = await resolveDescriptionText(opportunity.description, apiKey, samQuota);
+        const blob = buildEmbeddingBlob(opportunity, descriptionText);
+        const vector = await embedText(blob, EMBEDDING_MODEL_ID);
+        const score = cosineSimilarity(vector, profileEmbedding);
+
+        await markSeen(opportunity, score, relevanceLabel(score));
+        results[i] = { opportunity, score };
+      } catch (err) {
+        // Leave this one unmarked (not persisted as "seen") so it's picked
+        // up again on a future run instead of silently dropped, and don't
+        // let one bad item take down the rest of the batch.
+        console.error(`Failed to score/persist opportunity ${opportunity.noticeId}:`, err);
+      }
+    },
     EMBED_CONCURRENCY
   );
 
-  const blobs = opportunities.map((o, i) => buildEmbeddingBlob(o, descriptionTexts[i]));
-  const vectors = await embedBatch(blobs, EMBEDDING_MODEL_ID, EMBED_CONCURRENCY);
-
-  return opportunities.map((opportunity, i) => ({
-    opportunity,
-    score: cosineSimilarity(vectors[i], profileEmbedding),
-  }));
+  return results.filter((r): r is ScoredOpportunity => r !== undefined);
 }
 
 function formatOpportunity(o: SamOpportunity, score: number): string {
@@ -274,57 +332,88 @@ function formatOpportunity(o: SamOpportunity, score: number): string {
   return lines.join('\n');
 }
 
+/**
+ * Publishes a short "the run failed" notice so a bad day is never silent —
+ * previously any thrown error (timeout, SAM.gov 429, etc.) skipped the SNS
+ * publish entirely and nobody heard anything. Best-effort: if even this
+ * fails, we log and give up rather than throwing a second error out of a
+ * catch block.
+ */
+async function publishFailureNotice(error: unknown, context: string): Promise<void> {
+  const message = error instanceof Error ? error.message : String(error);
+  try {
+    await snsClient.send(
+      new PublishCommand({
+        TopicArn: TOPIC_ARN,
+        Subject: 'Rebel Radar: run failed',
+        Message: `Today's solicitation check did not complete.\n\n${context}\n\nError: ${message}`,
+      })
+    );
+  } catch (notifyErr) {
+    console.error('Failed to publish failure notice to SNS:', notifyErr);
+  }
+}
+
 export const handler = async (): Promise<{ newCount: number; relevantCount: number }> => {
-  const apiKey = await getApiKey();
+  try {
+    const apiKey = await getApiKey();
 
-  const today = new Date();
-  const yesterday = new Date(today);
-  yesterday.setDate(today.getDate() - 1);
+    const today = new Date();
+    const yesterday = new Date(today);
+    yesterday.setDate(today.getDate() - 1);
 
-  const opportunities = await fetchOpportunities(
-    apiKey,
-    formatDate(yesterday),
-    formatDate(today)
-  );
+    const opportunities = await fetchOpportunities(
+      apiKey,
+      formatDate(yesterday),
+      formatDate(today)
+    );
 
-  // Phase 1: figure out which opportunities are new (read-only; no writes
-  // yet). Writing happens after scoring below so a Bedrock failure can't
-  // leave an opportunity marked "seen" with no score and no email — it'll
-  // simply be picked up again on the next run instead of being lost.
-  const candidates: SamOpportunity[] = [];
-  for (const opp of opportunities) {
-    if (await isNew(opp.noticeId)) {
-      candidates.push(opp);
+    // Phase 1: figure out which opportunities are new (read-only; no writes
+    // yet).
+    const candidates: SamOpportunity[] = [];
+    for (const opp of opportunities) {
+      if (await isNew(opp.noticeId)) {
+        candidates.push(opp);
+      }
     }
+
+    // Phase 2: score every candidate (not just the ones that will end up in
+    // the email), checkpointing each one to DynamoDB as it finishes so a
+    // timeout or crash partway through doesn't lose already-completed work
+    // or cause it to be redone (and re-billed against SAM.gov's daily
+    // request quota) on the next run.
+    const allScored = await scoreAndPersistOpportunities(candidates, apiKey);
+
+    // Phase 3: only solicitations at/above RELEVANCE_THRESHOLD go in the
+    // email, ranked best match first.
+    const scored = allScored
+      .filter((s) => s.score >= RELEVANCE_THRESHOLD)
+      .sort((a, b) => b.score - a.score);
+
+    const messageBody = scored.length
+      ? scored.map((s) => formatOpportunity(s.opportunity, s.score)).join('\n\n')
+      : 'No new relevant solicitations posted in the last day.';
+
+    await snsClient.send(
+      new PublishCommand({
+        TopicArn: TOPIC_ARN,
+        Subject: `Rebel Radar: ${scored.length} relevant solicitation(s)`,
+        Message: messageBody,
+      })
+    );
+
+    return { newCount: allScored.length, relevantCount: scored.length };
+  } catch (err) {
+    console.error('Rebel Radar run failed:', err);
+    await publishFailureNotice(
+      err,
+      'Any solicitations already scored before the failure were still recorded and will not be re-processed.'
+    );
+    // Re-throw so the invocation is still recorded as an error in CloudWatch
+    // (for any alarms/metrics watching invocation errors). This is now safe
+    // to do without causing a retry storm: the EventBridge rule target has
+    // retryAttempts set to 0, so this failure will NOT trigger an automatic
+    // same-day re-invocation — it just waits for tomorrow's schedule.
+    throw err;
   }
-
-  // Phase 2: score every candidate (not just the ones that will end up in
-  // the email) so relevance is recorded for all of them.
-  const allScored = await scoreOpportunities(candidates, apiKey);
-
-  // Phase 3: persist every candidate, scored, as seen — this is what makes
-  // dedup + the spot-check history work regardless of what made the email.
-  for (const s of allScored) {
-    await markSeen(s.opportunity, s.score, relevanceLabel(s.score));
-  }
-
-  // Phase 4: only solicitations at/above RELEVANCE_THRESHOLD go in the
-  // email, ranked best match first.
-  const scored = allScored
-    .filter((s) => s.score >= RELEVANCE_THRESHOLD)
-    .sort((a, b) => b.score - a.score);
-
-  const messageBody = scored.length
-    ? scored.map((s) => formatOpportunity(s.opportunity, s.score)).join('\n\n')
-    : 'No new relevant solicitations posted in the last day.';
-
-  await snsClient.send(
-    new PublishCommand({
-      TopicArn: TOPIC_ARN,
-      Subject: `Rebel Radar: ${scored.length} relevant solicitation(s)`,
-      Message: messageBody,
-    })
-  );
-
-  return { newCount: allScored.length, relevantCount: scored.length };
 };

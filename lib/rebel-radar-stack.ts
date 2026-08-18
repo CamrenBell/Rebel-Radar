@@ -77,7 +77,11 @@ export class RebelRadarStack extends cdk.Stack {
       entry: path.join(__dirname, '../lambda/fetch-solicitations/index.ts'),
       handler: 'handler',
       runtime: lambda.Runtime.NODEJS_20_X,
-      timeout: cdk.Duration.seconds(60),
+      // Bumped from 60s: gives normal-sized days more headroom before
+      // hitting the ceiling. No longer a correctness concern either way —
+      // the handler now checkpoints each solicitation to DynamoDB as it
+      // finishes, so a timeout mid-run no longer discards completed work.
+      timeout: cdk.Duration.seconds(180),
       memorySize: 256,
       environment: {
         TABLE_NAME: seenTable.tableName,
@@ -116,7 +120,18 @@ export class RebelRadarStack extends cdk.Stack {
       schedule: events.Schedule.cron({ minute: '0', hour: '13' }),
       description: 'Triggers Rebel Radar daily solicitation check',
     });
-    rule.addTarget(new targets.LambdaFunction(fetchFn));
+    rule.addTarget(
+      new targets.LambdaFunction(fetchFn, {
+        // Default async-Lambda retry policy is up to 185 attempts over 24h,
+        // which is what turned one bad run into a request-quota-exhausting
+        // storm (each blind retry re-fetches + re-resolves everything the
+        // failed run hadn't yet checkpointed). The handler now persists
+        // progress incrementally and reports failures itself via SNS, so a
+        // failed run should surface and wait for tomorrow's schedule
+        // instead of hammering SAM.gov again same-day.
+        retryAttempts: 0,
+      })
+    );
 
     // ---------------------------------------------------------------------
     // Outputs
