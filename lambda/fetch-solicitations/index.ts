@@ -17,9 +17,15 @@ const SECRET_ARN = process.env.SECRET_ARN!;
 
 // --- Relevance scoring config -----------------------------------------
 const EMBEDDING_MODEL_ID = process.env.EMBEDDING_MODEL_ID ?? 'amazon.titan-embed-text-v2:0';
-const RELEVANCE_THRESHOLD = Number(process.env.RELEVANCE_THRESHOLD ?? '0.75');
-const HIGH_RELEVANCE_THRESHOLD = Number(process.env.HIGH_RELEVANCE_THRESHOLD ?? '0.85');
+const RELEVANCE_THRESHOLD = Number(process.env.RELEVANCE_THRESHOLD ?? '0.5');
+const HIGH_RELEVANCE_THRESHOLD = Number(process.env.HIGH_RELEVANCE_THRESHOLD ?? '0.65');
 const PROFILE_EMBEDDING_KEY = process.env.PROFILE_EMBEDDING_KEY ?? '__COMPANY_PROFILE_EMBEDDING__';
+// When no new solicitation clears RELEVANCE_THRESHOLD on a given run, fall
+// back to emailing the best-scoring solicitations anyway (ranked by score,
+// highest first) so the digest is never empty just because nothing hit the
+// bar that day. Set to 0 to disable the fallback and go back to "quiet days
+// send a 'nothing relevant' notice."
+const FALLBACK_TOP_N = Number(process.env.FALLBACK_TOP_N ?? '10');
 // Bedrock calls in flight at once when embedding solicitations, and HTTP
 // calls in flight at once when resolving description text. Kept modest so
 // a busy day doesn't blow past Bedrock's default per-account TPS limit or
@@ -268,8 +274,9 @@ function relevanceLabel(score: number): string {
  *
  * Returns every opportunity that was successfully scored, unfiltered and in
  * input order — callers decide what to do with items below
- * RELEVANCE_THRESHOLD (currently: still recorded in DynamoDB as "Low", just
- * left out of the email).
+ * RELEVANCE_THRESHOLD (currently: recorded in DynamoDB as "Low", and shown
+ * in the email only via the top-N fallback on days when nothing clears the
+ * threshold).
  */
 async function scoreAndPersistOpportunities(
   opportunities: SamOpportunity[],
@@ -384,25 +391,46 @@ export const handler = async (): Promise<{ newCount: number; relevantCount: numb
     // request quota) on the next run.
     const allScored = await scoreAndPersistOpportunities(candidates, apiKey);
 
-    // Phase 3: only solicitations at/above RELEVANCE_THRESHOLD go in the
-    // email, ranked best match first.
-    const scored = allScored
+    // Phase 3: solicitations at/above RELEVANCE_THRESHOLD go in the email,
+    // ranked best match first.
+    const relevant = allScored
       .filter((s) => s.score >= RELEVANCE_THRESHOLD)
       .sort((a, b) => b.score - a.score);
 
-    const messageBody = scored.length
-      ? scored.map((s) => formatOpportunity(s.opportunity, s.score)).join('\n\n')
-      : 'No new relevant solicitations posted in the last day.';
+    // Fallback: if nothing cleared the threshold but there were still new
+    // solicitations today, send the top FALLBACK_TOP_N by score anyway
+    // rather than an empty digest.
+    const usedFallback = relevant.length === 0 && allScored.length > 0 && FALLBACK_TOP_N > 0;
+    const scored = usedFallback
+      ? [...allScored].sort((a, b) => b.score - a.score).slice(0, FALLBACK_TOP_N)
+      : relevant;
+
+    let subject: string;
+    let messageBody: string;
+    if (relevant.length > 0) {
+      subject = `Rebel Radar: ${scored.length} relevant solicitation(s)`;
+      messageBody = scored.map((s) => formatOpportunity(s.opportunity, s.score)).join('\n\n');
+    } else if (scored.length > 0) {
+      subject = `Rebel Radar: no strong matches - top ${scored.length} shown`;
+      messageBody =
+        `No new solicitations scored at or above the relevance threshold ` +
+        `(${RELEVANCE_THRESHOLD}) in the last day. Showing the ${scored.length} ` +
+        `closest match(es) by score instead:\n\n` +
+        scored.map((s) => formatOpportunity(s.opportunity, s.score)).join('\n\n');
+    } else {
+      subject = 'Rebel Radar: 0 relevant solicitation(s)';
+      messageBody = 'No new solicitations posted in the last day.';
+    }
 
     await snsClient.send(
       new PublishCommand({
         TopicArn: TOPIC_ARN,
-        Subject: `Rebel Radar: ${scored.length} relevant solicitation(s)`,
+        Subject: subject,
         Message: messageBody,
       })
     );
 
-    return { newCount: allScored.length, relevantCount: scored.length };
+    return { newCount: allScored.length, relevantCount: relevant.length };
   } catch (err) {
     console.error('Rebel Radar run failed:', err);
     await publishFailureNotice(

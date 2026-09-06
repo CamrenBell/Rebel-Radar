@@ -9,15 +9,17 @@ const app = new cdk.App();
 //   cdk deploy -c alertEmail=you@rebelcontracting.com
 const alertEmail = app.node.tryGetContext('alertEmail');
 
-// Optional relevance-scoring threshold overrides, e.g.:
-//   cdk deploy -c relevanceThreshold=0.7 -c highRelevanceThreshold=0.9
+// Optional relevance-scoring overrides, e.g.:
+//   cdk deploy -c relevanceThreshold=0.6 -c highRelevanceThreshold=0.75 -c fallbackTopN=5
 const relevanceThreshold = app.node.tryGetContext('relevanceThreshold');
 const highRelevanceThreshold = app.node.tryGetContext('highRelevanceThreshold');
+const fallbackTopN = app.node.tryGetContext('fallbackTopN');
 
 new RebelRadarStack(app, 'RebelRadarStack', {
   alertEmail,
   relevanceThreshold,
   highRelevanceThreshold,
+  fallbackTopN,
   env: {
     account: process.env.CDK_DEFAULT_ACCOUNT,
     region: process.env.CDK_DEFAULT_REGION,

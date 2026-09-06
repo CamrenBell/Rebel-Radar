@@ -20,17 +20,25 @@ export interface RebelRadarStackProps extends cdk.StackProps {
   alertEmail?: string;
   /**
    * Minimum cosine-similarity score (0–1) a solicitation must have against
-   * the company profile embedding to be included in the email digest at
-   * all. Deploy-time override: `cdk deploy -c relevanceThreshold=0.7`
+   * the company profile embedding to be included in the email digest as a
+   * "relevant" match. Deploy-time override:
+   * `cdk deploy -c relevanceThreshold=0.6`
    */
   relevanceThreshold?: string;
   /**
    * Cosine-similarity score (0–1) at/above which a solicitation is labeled
    * "High" relevance instead of "Medium" in the digest. Must stay >=
    * relevanceThreshold to be meaningful. Deploy-time override:
-   * `cdk deploy -c highRelevanceThreshold=0.9`
+   * `cdk deploy -c highRelevanceThreshold=0.75`
    */
   highRelevanceThreshold?: string;
+  /**
+   * When no new solicitation clears relevanceThreshold on a run, email the
+   * top N by score anyway so the digest is never empty on a slow day. Set
+   * to "0" to disable and send a "nothing relevant" notice instead.
+   * Deploy-time override: `cdk deploy -c fallbackTopN=5`
+   */
+  fallbackTopN?: string;
 }
 
 export class RebelRadarStack extends cdk.Stack {
@@ -88,8 +96,9 @@ export class RebelRadarStack extends cdk.Stack {
         TOPIC_ARN: alertTopic.topicArn,
         SECRET_ARN: samApiSecret.secretArn,
         EMBEDDING_MODEL_ID,
-        RELEVANCE_THRESHOLD: props?.relevanceThreshold ?? '0.75',
-        HIGH_RELEVANCE_THRESHOLD: props?.highRelevanceThreshold ?? '0.85',
+        RELEVANCE_THRESHOLD: props?.relevanceThreshold ?? '0.5',
+        HIGH_RELEVANCE_THRESHOLD: props?.highRelevanceThreshold ?? '0.65',
+        FALLBACK_TOP_N: props?.fallbackTopN ?? '10',
       },
     });
 
