@@ -29,18 +29,21 @@ Every solicitation that survives the dedup check is scored for relevance before 
 
    The SAM.gov search response only gives a *link* to the full description text, not the text itself, so the Lambda resolves that link (also via a small concurrent worker pool, best-effort — a failed fetch falls back to an empty description rather than failing the run) before building the blob.
 
-3. **Scoring and filtering.** Each solicitation vector is compared to the cached profile vector via in-memory cosine similarity — no OpenSearch or other vector store. Every new solicitation gets a score and a label (`High` at/above `HIGH_RELEVANCE_THRESHOLD`, `Medium` at/above `RELEVANCE_THRESHOLD`, `Low` below it), written to its record in the `solicitations` DynamoDB table as `relevanceScore` / `relevanceLabel` — so you can spot-check how anything scored, including solicitations that got filtered out, directly in the table. Only what's at/above `RELEVANCE_THRESHOLD` (`High`/`Medium`) makes it into the email, sorted by score descending.
+3. **Scoring and filtering.** Each solicitation vector is compared to the cached profile vector via in-memory cosine similarity — no OpenSearch or other vector store. Every new solicitation gets a score and a label (`High` at/above `HIGH_RELEVANCE_THRESHOLD`, `Medium` at/above `RELEVANCE_THRESHOLD`, `Low` below it), written to its record in the `solicitations` DynamoDB table as `relevanceScore` / `relevanceLabel` — so you can spot-check how anything scored, including solicitations that got filtered out, directly in the table. What's at/above `RELEVANCE_THRESHOLD` (`High`/`Medium`) makes it into the email as a relevant match, sorted by score descending (see the empty-day fallback below for what happens when nothing clears the bar).
 
    Scoring happens *before* a solicitation is written to DynamoDB, not after — if Bedrock scoring fails partway through a run, nothing gets marked "seen" without a score, so a transient Bedrock outage can't silently drop a solicitation forever. It just gets picked up and scored again on the next run.
 
    Note that `relevanceScore`/`relevanceLabel` are a snapshot from whatever `RELEVANCE_THRESHOLD` / `HIGH_RELEVANCE_THRESHOLD` / company profile text were in effect at write time — changing the threshold or profile later doesn't retroactively re-label already-written items.
 
+4. **Empty-day fallback.** If a run finds new solicitations but none clear `RELEVANCE_THRESHOLD`, the email still goes out with the top `FALLBACK_TOP_N` (default 10) by score, flagged as closest-matches-only rather than confirmed relevant. Only a run that finds no new solicitations at all sends the "nothing new" notice. Set `FALLBACK_TOP_N=0` to disable this and always send the notice on sub-threshold days.
+
 ### Config
 
 | Env var / CDK context | Default | Purpose |
 | --- | --- | --- |
-| `RELEVANCE_THRESHOLD` (context: `relevanceThreshold`) | `0.75` | Minimum cosine similarity to include a solicitation in the email at all. |
-| `HIGH_RELEVANCE_THRESHOLD` (context: `highRelevanceThreshold`) | `0.85` | Cosine similarity at/above which a solicitation is labeled "High" instead of "Medium". |
+| `RELEVANCE_THRESHOLD` (context: `relevanceThreshold`) | `0.5` | Minimum cosine similarity to count a solicitation as a relevant match in the email. |
+| `HIGH_RELEVANCE_THRESHOLD` (context: `highRelevanceThreshold`) | `0.65` | Cosine similarity at/above which a solicitation is labeled "High" instead of "Medium". |
+| `FALLBACK_TOP_N` (context: `fallbackTopN`) | `10` | On runs where new solicitations exist but none clear `RELEVANCE_THRESHOLD`, email this many top-scoring ones anyway. `0` disables the fallback. |
 | `EMBEDDING_MODEL_ID` | `amazon.titan-embed-text-v2:0` | Bedrock model used for both the profile and solicitation embeddings. The Lambda's IAM policy is scoped to this exact model. |
 | `PROFILE_EMBEDDING_KEY` | `__COMPANY_PROFILE_EMBEDDING__` | Partition key used to cache the profile embedding in the `solicitations` table. |
 | `EMBED_CONCURRENCY` | `15` | Max concurrent Bedrock/description-fetch calls per run. |
@@ -48,7 +51,7 @@ Every solicitation that survives the dedup check is scored for relevance before 
 Override the threshold context values the same way `alertEmail` is passed:
 
 ```bash
-npx cdk deploy -c alertEmail=you@rebelcontracting.com -c relevanceThreshold=0.7 -c highRelevanceThreshold=0.9
+npx cdk deploy -c alertEmail=you@rebelcontracting.com -c relevanceThreshold=0.6 -c highRelevanceThreshold=0.75 -c fallbackTopN=5
 ```
 
 ### Updating the company profile

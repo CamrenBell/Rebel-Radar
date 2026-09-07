@@ -20,17 +20,25 @@ export interface RebelRadarStackProps extends cdk.StackProps {
   alertEmail?: string;
   /**
    * Minimum cosine-similarity score (0–1) a solicitation must have against
-   * the company profile embedding to be included in the email digest at
-   * all. Deploy-time override: `cdk deploy -c relevanceThreshold=0.7`
+   * the company profile embedding to be included in the email digest as a
+   * "relevant" match. Deploy-time override:
+   * `cdk deploy -c relevanceThreshold=0.6`
    */
   relevanceThreshold?: string;
   /**
    * Cosine-similarity score (0–1) at/above which a solicitation is labeled
    * "High" relevance instead of "Medium" in the digest. Must stay >=
    * relevanceThreshold to be meaningful. Deploy-time override:
-   * `cdk deploy -c highRelevanceThreshold=0.9`
+   * `cdk deploy -c highRelevanceThreshold=0.75`
    */
   highRelevanceThreshold?: string;
+  /**
+   * When no new solicitation clears relevanceThreshold on a run, email the
+   * top N by score anyway so the digest is never empty on a slow day. Set
+   * to "0" to disable and send a "nothing relevant" notice instead.
+   * Deploy-time override: `cdk deploy -c fallbackTopN=5`
+   */
+  fallbackTopN?: string;
 }
 
 export class RebelRadarStack extends cdk.Stack {
@@ -77,15 +85,20 @@ export class RebelRadarStack extends cdk.Stack {
       entry: path.join(__dirname, '../lambda/fetch-solicitations/index.ts'),
       handler: 'handler',
       runtime: lambda.Runtime.NODEJS_20_X,
-      timeout: cdk.Duration.seconds(60),
+      // Bumped from 60s: gives normal-sized days more headroom before
+      // hitting the ceiling. No longer a correctness concern either way —
+      // the handler now checkpoints each solicitation to DynamoDB as it
+      // finishes, so a timeout mid-run no longer discards completed work.
+      timeout: cdk.Duration.seconds(180),
       memorySize: 256,
       environment: {
         TABLE_NAME: seenTable.tableName,
         TOPIC_ARN: alertTopic.topicArn,
         SECRET_ARN: samApiSecret.secretArn,
         EMBEDDING_MODEL_ID,
-        RELEVANCE_THRESHOLD: props?.relevanceThreshold ?? '0.75',
-        HIGH_RELEVANCE_THRESHOLD: props?.highRelevanceThreshold ?? '0.85',
+        RELEVANCE_THRESHOLD: props?.relevanceThreshold ?? '0.5',
+        HIGH_RELEVANCE_THRESHOLD: props?.highRelevanceThreshold ?? '0.65',
+        FALLBACK_TOP_N: props?.fallbackTopN ?? '10',
       },
     });
 
@@ -116,7 +129,18 @@ export class RebelRadarStack extends cdk.Stack {
       schedule: events.Schedule.cron({ minute: '0', hour: '13' }),
       description: 'Triggers Rebel Radar daily solicitation check',
     });
-    rule.addTarget(new targets.LambdaFunction(fetchFn));
+    rule.addTarget(
+      new targets.LambdaFunction(fetchFn, {
+        // Default async-Lambda retry policy is up to 185 attempts over 24h,
+        // which is what turned one bad run into a request-quota-exhausting
+        // storm (each blind retry re-fetches + re-resolves everything the
+        // failed run hadn't yet checkpointed). The handler now persists
+        // progress incrementally and reports failures itself via SNS, so a
+        // failed run should surface and wait for tomorrow's schedule
+        // instead of hammering SAM.gov again same-day.
+        retryAttempts: 0,
+      })
+    );
 
     // ---------------------------------------------------------------------
     // Outputs
